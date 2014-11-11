@@ -1,12 +1,12 @@
 package redsync_test
 
 import (
+	"github.com/fzzy/radix/redis"
 	"math/rand"
 	"net"
 	"testing"
 	"time"
-
-	"github.com/hjr265/redsync.go/redsync"
+	"github.com/austinov/redsync.go/redsync"
 )
 
 var addrs = []net.Addr{
@@ -16,13 +16,47 @@ var addrs = []net.Addr{
 	&net.TCPAddr{Port: 63793},
 }
 
+// Implementation of RedisExecutor interface
+type RadixExecutor struct {
+	Conn *redis.Client
+}
+
+// Implementation of RedisExecutor interface
+func (this *RadixExecutor) DoSetNxPx(key, value string, milliseconds int) (bool, error) {
+	reply := this.Conn.Cmd("set", key, value, "nx", "px", milliseconds)
+	return (reply.String() == "OK"), reply.Err
+}
+
+// Implementation of RedisExecutor interface
+func (this *RadixExecutor) DoScript(script string, key string, arg string) error {
+	reply := this.Conn.Cmd("eval", script, 1, key, arg)
+	return reply.Err
+}
+
 func TestMutex(t *testing.T) {
 	done := make(chan bool)
 	chErr := make(chan error)
 
-	for i := 0; i < 4; i++ {
+	executors := make([]redsync.RedisExecutor, 0)
+	for _, addr := range addrs {
+		if conn, err := redis.Dial(addr.Network(), addr.String()); err != nil {
+			t.Fatal(err)
+		} else {
+			executors = append(executors, &RadixExecutor{ conn })
+		}
+	}
+	defer func() {
+		for _, executor := range executors {
+			if executor != nil {
+				radixConn := executor.(*RadixExecutor)
+				(*radixConn.Conn).Close()
+			}
+		}
+	}()
+
+	for i := 0; i < len(addrs); i++ {
 		go func() {
-			m, err := redsync.NewMutex("RedsyncMutex", addrs)
+			m, err := redsync.NewMutex("RedsyncMutex", executors)
 			if err != nil {
 				chErr <- err
 				return
@@ -53,7 +87,7 @@ func TestMutex(t *testing.T) {
 			done <- true
 		}()
 	}
-	for i := 0; i < 4; i++ {
+	for i := 0; i < len(addrs); i++ {
 		select {
 		case <-done:
 		case err := <-chErr:

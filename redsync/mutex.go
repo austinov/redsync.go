@@ -7,11 +7,8 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"net"
 	"sync"
 	"time"
-
-	"github.com/fzzy/radix/redis"
 )
 
 const (
@@ -28,6 +25,16 @@ var (
 type Locker interface {
 	Lock() error
 	Unlock()
+}
+
+// Interface represents an executor commands on a Redis
+type RedisExecutor interface {
+
+	// Perform set key to hold the string value if it does not already exist (NX option) and with the specified expire time, in milliseconds (PX option)
+	DoSetNxPx(key, value string, milliseconds int) (bool, error)
+
+	// Perform evaluates a script with one key and one argument
+	DoScript(script string, key string, arg string) error
 }
 
 // A Mutex is a mutual exclusion lock.
@@ -47,28 +54,22 @@ type Mutex struct {
 	value string
 	until time.Time
 
-	nodes []*redis.Client
+	executors []RedisExecutor // Redis connections
 	nodem sync.Mutex
 }
 
 var _ = Locker(&Mutex{})
 
-// NewMutex returns a new Mutex on a named resource connected to the Redis instances at given addresses.
-func NewMutex(name string, addrs []net.Addr) (*Mutex, error) {
-	if len(addrs) == 0 {
-		panic("redsync: addrs is empty")
-	}
-
-	nodes := []*redis.Client{}
-	for _, addr := range addrs {
-		node, _ := redis.Dial(addr.Network(), addr.String())
-		nodes = append(nodes, node)
+// NewMutex returns a new Mutex on a named resource connected to the Redis instances at given executors.
+func NewMutex(name string, executors []RedisExecutor) (*Mutex, error) {
+	if len(executors) == 0 {
+		panic("redsync: executors is empty")
 	}
 
 	return &Mutex{
 		Name:   name,
-		Quorum: len(addrs)/2 + 1,
-		nodes:  nodes,
+		Quorum: len(executors)/2 + 1,
+		executors:  executors,
 	}, nil
 }
 
@@ -98,16 +99,16 @@ func (m *Mutex) Lock() error {
 	for i := 0; i < retries; i++ {
 		n := 0
 		start := time.Now()
-		for _, node := range m.nodes {
-			if node == nil {
+		for _, executor := range m.executors {
+			if executor == nil {
 				continue
 			}
 
-			reply := node.Cmd("set", m.Name, value, "nx", "px", int(expiry/time.Millisecond))
-			if reply.Err != nil {
+			ok, err := executor.DoSetNxPx(m.Name, value, int(expiry/time.Millisecond))
+			if err != nil {
 				continue
 			}
-			if reply.String() != "OK" {
+			if !ok {
 				continue
 			}
 			n += 1
@@ -118,25 +119,25 @@ func (m *Mutex) Lock() error {
 			factor = DefaultFactor
 		}
 
-		until := time.Now().Add(m.Expiry - time.Now().Sub(start) - time.Duration(int64(float64(m.Expiry)*factor)) + 2*time.Millisecond)
+		// Fix: in the next line "m.Expiry" replaced to the local variable "expiry"
+		until := time.Now().Add(expiry - time.Now().Sub(start) - time.Duration(int64(float64(expiry)*factor)) + 2*time.Millisecond)
 		if n >= m.Quorum && time.Now().Before(until) {
 			m.value = value
 			m.until = until
 			return nil
 		} else {
-			for _, node := range m.nodes {
-				if node == nil {
+			for _, executor := range m.executors {
+				if executor == nil {
 					continue
 				}
 
-				reply := node.Cmd("eval", `
-					if redis.call("get", KEYS[1]) == ARGV[1] then
-					    return redis.call("del", KEYS[1])
-					else
-					    return 0
-					end
-				`, 1, m.Name, value)
-				if reply.Err != nil {
+				err := executor.DoScript(`if redis.call("get", KEYS[1]) == ARGV[1] then
+					                        return redis.call("del", KEYS[1])
+					                      else
+					                        return 0
+					                      end`,
+					                      m.Name, value)
+				if err != nil {
 					continue
 				}
 			}
@@ -166,17 +167,16 @@ func (m *Mutex) Unlock() {
 	m.value = ""
 	m.until = time.Unix(0, 0)
 
-	for _, node := range m.nodes {
-		if node == nil {
+	for _, executor := range m.executors {
+		if executor == nil {
 			continue
 		}
 
-		node.Cmd("eval", `
-			if redis.call("get", KEYS[1]) == ARGV[1] then
-			    return redis.call("del", KEYS[1])
-			else
-			    return 0
-			end
-		`, 1, m.Name, value)
+		executor.DoScript(`if redis.call("get", KEYS[1]) == ARGV[1] then
+					         return redis.call("del", KEYS[1])
+					       else
+					         return 0
+					       end`,
+			               m.Name, value)
 	}
 }
