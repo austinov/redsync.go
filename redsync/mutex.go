@@ -54,7 +54,7 @@ type Mutex struct {
 	value string
 	until time.Time
 
-	executors []RedisExecutor // Redis connections
+	executors []RedisExecutor // Executors of commands on Redis
 	nodem sync.Mutex
 }
 
